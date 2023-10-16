@@ -4,36 +4,51 @@ using namespace System.Net
 param($Request, $TriggerMetadata)
 
 $APIName = $TriggerMetadata.FunctionName
-Log-Request -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Accessed this API" -Sev "Debug"
-$Results = [System.Collections.ArrayList]@()
-
-
-# Write to the Azure Functions log stream.
-Write-Host "PowerShell HTTP trigger function processed a request."
-
-# Interact with query parameters or the body of the request.
+Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -message 'Accessed this API' -Sev 'Debug'
 
 $tenantDisplayName = $request.body.displayName
 $tenantDefaultDomainName = $request.body.defaultDomainName
 $Tenant = $request.body.tenantid
-$tenantObjID = $request.body.id
+$customerContextId = $request.body.customerId
 
-
-$results = try {
-    $bodyToPatch = '{"displayName":"' + $tenantDisplayName + '","defaultDomainName":"' + $tenantDefaultDomainName + '",}'
-    $Request = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/contracts/$tenantObjID" -type PATCH -body $bodyToPatch
-    Log-Request -user $request.headers.'x-ms-client-principal' -API $APINAME -tenant $($Tenant) -message "Edited tenant $($Tenant)" -Sev "Info"
-    Remove-CIPPCache
-
-    "Successfully amended details for $($Tenant) and cleared tenant cache<br>"
-
-} catch {
-    "Failed to amend details for $($Tenant): $($_.ExceptionMessage) <br>"
-    Log-Request -user $request.headers.'x-ms-client-principal' -API $APINAME -tenant $($Tenant) -message "Failed amending details $($tenantDisplayName). Error: $($_.Exception.Message)" -Sev "Error"
-    continue
+$tokens = try {
+    $AADGraphtoken = (Get-GraphToken -scope 'https://graph.windows.net/.default')
+    $allTenantsDetails = (Invoke-RestMethod -Method GET -Uri 'https://graph.windows.net/myorganization/contracts?api-version=1.6' -ContentType 'application/json' -Headers $AADGraphtoken)
+    $tenantObjectId = $allTenantsDetails.value | Where-Object { $_.customerContextId -eq $customerContextId } | Select-Object 'objectId'
+}
+catch {
+    $Results = "Failed to retrieve list of tenants.  Error: $($_.Exception.Message)"
+    Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -tenant $($tenantDisplayName) -message "Failed to retrieve list of tenants. Error: $($_.Exception.Message)" -Sev 'Error'
 }
 
-$body = [pscustomobject]@{"Results" = $results }
+
+if ($tenantObjectId) {
+    try {
+        $bodyToPatch = '{"displayName":"' + $tenantDisplayName + '","defaultDomainName":"' + $tenantDefaultDomainName + '"}'
+        $patchTenant = (Invoke-RestMethod -Method PATCH -Uri "https://graph.windows.net/myorganization/contracts/$($tenantObjectId.objectId)?api-version=1.6" -Body $bodyToPatch -ContentType 'application/json' -Headers $AADGraphtoken -ErrorAction Stop)    
+        $Filter = "PartitionKey eq 'Tenants' and defaultDomainName eq '{0}'" -f $tenantDefaultDomainName
+        try {
+            $TenantsTable = Get-CippTable -tablename Tenants
+            $Tenant = Get-AzDataTableEntity @TenantsTable -Filter $Filter 
+            $Tenant.displayName = $tenantDisplayName
+            Update-AzDataTableEntity @TenantsTable -Entity $Tenant
+        }
+        catch {
+            $AddedText = "but could not edit the tenant cache. Clear the tenant cache to display the updated details"
+        }
+        Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -tenant $tenantDisplayName -message "Edited tenant $tenantDisplayName" -Sev 'Info'
+        $results = "Successfully amended details for $($Tenant.displayName) $AddedText"
+    }
+    catch { 
+        $results = "Failed to amend details for $tenantDisplayName : $($_.Exception.Message)"
+        Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -tenant $tenantDisplayName -message "Failed amending details $tenantDisplayName. Error: $($_.Exception.Message)" -Sev 'Error'
+    }
+}
+else {
+    $Results = "Could not find the tenant to edit in the contract endpoint. Please ensure you have a reseller relationship with the tenant you are trying to edit."
+}
+
+$body = [pscustomobject]@{'Results' = $results }
 
 # Associate values to output bindings by calling 'Push-OutputBinding'.
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{

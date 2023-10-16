@@ -1,91 +1,69 @@
-param($tenant)
+param($DomainObject)
 
-function Get-GoogleDNSQuery {
-    [CmdletBinding()]
-    param (
-        [Parameter()]
-        [string]
-        $Domain,
+Import-Module DNSHealth
 
-        [Parameter()]
-        [string]
-        $RecordType,
+try {
+    $ConfigTable = Get-CippTable -tablename Config
+    $Filter = "PartitionKey eq 'Domains' and RowKey eq 'Domains'"
+    $Config = Get-AzDataTableEntity @ConfigTable -Filter $Filter
 
-        [Parameter()]
-        [bool]
-        $FullResultRecord = $False
-    )
-
-    try {                
-        $Results = Invoke-RestMethod -Uri "https://dns.google/resolve?name=$($Domain)&type=$($RecordType)" -Method Get
-    }
-    catch {
-        Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "Get Google DNS Query Failed with $($_.Exception.Message)" -sev Debug
-    }
-
-    # Domain does not exist
-    if ($Results.Status -ne 0) {
-        return $null
-    }
-
-    if (($Results.Answer | Measure-Object | Select-Object -ExpandProperty Count) -eq 0) {
-        return $null
+    $ValidResolvers = @('Google', 'CloudFlare', 'Quad9')
+    if ($ValidResolvers -contains $Config.Resolver) {
+        $Resolver = $Config.Resolver
     }
     else {
-        if ($RecordType -eq 'MX') {
-            $FinalClean = $Results.Answer | ForEach-Object { $_.Data.Split(' ')[1] }
-            return $FinalClean
+        $Resolver = 'Google'
+        $Config = @{
+            PartitionKey = 'Domains'
+            RowKey       = 'Domains'
+            Resolver     = $Resolver
         }
-        if (!$FullResultRecord) {
-            return $Results.Answer
-        }
-        else {
-            return $Results
-        }
+        Add-AzDataTableEntity @ConfigTable -Entity $Config -Force
     }
 }
+catch {
+    $Resolver = 'Google'
+}
+Set-DnsResolver -Resolver $Resolver
 
-$Domain = $Tenant.Domain
+$Domain = $DomainObject.rowKey
 
-Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "Starting Processing of $($Tenant.Domain)" -sev Debug
+try {
+    $Tenant = $DomainObject.TenantDetails | ConvertFrom-Json -ErrorAction Stop
+}
+catch {
+    $Tenant = @{Tenant = 'None' }
+}
+
+#Write-Host "$($DomainObject.TenantDetails)"
+
 $Result = [PSCustomObject]@{
-    Tenant               = $tenant.tenant
-    GUID                 = $($Tenant.Domain.Replace('.', ''))
+    Tenant               = $Tenant.Tenant
+    GUID                 = $($Domain.Replace('.', ''))
     LastRefresh          = $(Get-Date (Get-Date).ToUniversalTime() -UFormat '+%Y-%m-%dT%H:%M:%S.000Z')
     Domain               = $Domain
-    AuthenticationType   = $Tenant.authenticationType
-    IsAdminManaged       = $Tenant.isAdminManaged
-    IsDefault            = $Tenant.isDefault
-    IsInitial            = $Tenant.isInitial
-    IsRoot               = $Tenant.isRoot
-    IsVerified           = $Tenant.isVerified
-    SupportedServices    = $Tenant.supportedServices
-    ExpectedSPFRecord    = ""
-    ActualSPFRecord      = ""
-    SPFPassTest          = ""
-    SPFPassAll           = ""
-    ExpectedMXRecord     = ""
-    ActualMXRecord       = ""
-    MXPassTest           = ""
-    DMARCPresent         = ""
-    DMARCFullPolicy      = ""
-    DMARCActionPolicy    = ""
-    DMARCReportingActive = ""
-    DMARCPercentagePass  = ""
-    DNSSECPresent        = ""
-    MailProvider         = ""
-    DKIMEnabled          = ""
-    Score                = ""
+    ExpectedSPFRecord    = ''
+    ActualSPFRecord      = ''
+    SPFPassAll           = ''
+    MXPassTest           = ''
+    DMARCPresent         = ''
+    DMARCFullPolicy      = ''
+    DMARCActionPolicy    = ''
+    DMARCReportingActive = ''
+    DMARCPercentagePass  = ''
+    DNSSECPresent        = ''
+    MailProvider         = ''
+    DKIMEnabled          = ''
+    Score                = ''
     MaximumScore         = 160
-    ScorePercentage      = ""
-    ScoreExplanation     = ""
+    ScorePercentage      = ''
+    ScoreExplanation     = ''
 }
 
 $Scores = [PSCustomObject]@{
     SPFPresent           = 10
-    SPFMSRecommended     = 10
-    SPFCorrectAll        = 10
-    MXMSRecommended      = 10
+    SPFCorrectAll        = 20
+    MXRecommended        = 10
     DMARCPresent         = 10
     DMARCSetQuarantine   = 20
     DMARCSetReject       = 30
@@ -97,194 +75,181 @@ $Scores = [PSCustomObject]@{
 
 $ScoreDomain = 0
 # Setup Score Explanation
-[System.Collections.ArrayList]$ScoreExplanation = @()
+$ScoreExplanation = [System.Collections.Generic.List[string]]::new()
 
-# Get 365 Service Configuration Records
-$ServiceConfigRecords = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/domains/$($domain)/serviceConfigurationRecords" -tenantid $tenant.tenant
+# Check MX Record
+$MXRecord = Read-MXRecord -Domain $Domain -ErrorAction Stop
 
-$Result.ExpectedMXRecord = $ServiceConfigRecords | Where-Object { $_.RecordType -eq "MX" } | Select-Object -ExpandProperty MailExchange
-$Result.ExpectedSPFRecord = $ServiceConfigRecords | Where-Object { ($_.RecordType -eq "Txt") -and ($_.Text -like "*spf*") } | Select-Object -ExpandProperty Text
+$Result.ExpectedSPFRecord = $MXRecord.ExpectedInclude
+$Result.MXPassTest = $false
+
+# Check fail counts to ensure all tests pass
+#$MXWarnCount = $MXRecord.ValidationWarns | Measure-Object | Select-Object -ExpandProperty Count
+$MXFailCount = $MXRecord.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
+
+if ($MXFailCount -eq 0) {
+    $Result.MXPassTest = $true
+    $ScoreDomain += $Scores.MXRecommended
+}
+else {
+    $ScoreExplanation.Add('MX record did not pass validation') | Out-Null
+}
+
+if ([string]::IsNullOrEmpty($MXRecord.MailProvider)) {
+    $Result.MailProvider = 'Unknown'
+}
+else {
+    $Result.MailProvider = $MXRecord.MailProvider.Name
+}
 
 # Get SPF Record
 try {
-    $Results = Get-GoogleDNSQuery -Domain $domain -RecordType "TXT"
-    $SPFResults = $Results | Where-Object { $_.Data -like '*spf1*' } | Select-Object -ExpandProperty Data
-    if ($SPFResults.Count -gt 0) {
-        $Result.ActualSPFRecord = $SPFResults | Where-Object { $_ -like '*spf1*' }
-        $ScoreDomain += $Scores.SPFPresent
+    $SPFRecord = Read-SpfRecord -Domain $Domain -ErrorAction Stop
+    if ($SPFRecord.RecordCount -gt 0) {
+        $Result.ActualSPFRecord = $SPFRecord.Record
+        if ($SPFRecord.RecordCount -eq 1) {
+            $ScoreDomain += $Scores.SPFPresent
+        }
+        else {
+            $ScoreExplanation.Add('Multiple SPF records detected') | Out-Null
+        }
     }
     else {
-        $Result.ActualSPFRecord = "No SPF Record"
-        $ScoreExplanation.Add("No SPF Record Found") | Out-Null
+        $Result.ActualSPFRecord = 'No SPF Record'
+        $ScoreExplanation.Add('No SPF Record Found') | Out-Null
     }
 }
 catch {
-    Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "Exception and Error while getting SPF Record with $($_.Exception.Message)" -sev Error
+    $Message = 'SPF Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+    throw $Message
 }
     
 # Check SPF Record
-$SPFMatch = $Result.ActualSPFRecord | Where-Object { $_ -like "$($Result.ExpectedSPFRecord)" }
-If (($SPFMatch | Measure-Object | Select-Object -ExpandProperty Count) -gt 0) {
-    $ScoreDomain += $Scores.SPFMSRecommended
-    $Result.SPFPassTest = $true
-    if ($SPFMatch -like '*-all*') {
-        $ScoreDomain += $Scores.SPFCorrectAll
-        $Result.SPFPassAll = $true
-    }
-    else {
-        $Result.SPFPassAll = $false
-        $ScoreExplanation.Add("SPF Record is not set to hard Fail") | Out-Null 
-    }
+$Result.SPFPassAll = $false
+
+# Check warning + fail counts to ensure all tests pass
+#$SPFWarnCount = $SPFRecord.ValidationWarns | Measure-Object | Select-Object -ExpandProperty Count
+$SPFFailCount = $SPFRecord.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
+
+if ($SPFFailCount -eq 0) {
+    $ScoreDomain += $Scores.SPFCorrectAll
+    $Result.SPFPassAll = $true
 }
 else {
-    if ($Result.ActualSPFRecord -like '*include:spf.protection.outlook.com*') {
-        $ScoreDomain += $Scores.SPFMSRecommended
-        $Result.SPFPassTest = $true
-        if ($Result.ActualSPFRecord -like '*-all*') {
-            $ScoreDomain += $Scores.SPFCorrectAll
-            $Result.SPFPassAll = $true
-        }
-        else {
-            $Result.SPFPassAll = $false
-        }
-    }
-    else {
-        $ScoreExplanation.Add("SPF Record is Misconfigured") | Out-Null 
-        $Result.SPFPassTest = $false
-        $Result.SPFPassAll = $false
-    }
-
-}
-    
-# Get MX Record
-try {
-    $MXResults = Get-GoogleDNSQuery -domain $domain -RecordType "MX"
-    $Result.ActualMXRecord = ($MXResults) -join ","
-}
-catch {
-    Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "Exception and Error while getting MX Record with $($_.Exception.Message)" -sev Error
-}
-
-# Check MX Record
-$MXMatch = $Result.ActualMXRecord | Where-Object { $_ -like "*$($Result.ExpectedMXRecord)*" }
-If (($MXMatch | Measure-Object | Select-Object -ExpandProperty Count) -gt 0) {
-    $Result.MXPassTest = $true
-    $ScoreDomain += $Scores.MXMSRecommended
-}
-else { 
-    $Result.MXPassTest = $false
-    $ScoreExplanation.Add("MX Record does not match Microsoft's suggestion") | Out-Null 
+    $ScoreExplanation.Add('SPF record did not pass validation') | Out-Null
 }
 
 # Get DMARC Record
 try {
-    #$DMARCResults = Resolve-DnsName -Name "_dmarc.$($domain)" -Type TXT -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq "TXT" }
-    $DMARCResults = Get-GoogleDNSQuery -Domain "_dmarc.$($domain)" -RecordType "TXT"
-    If ([string]::IsNullOrEmpty($DMARCResults.data)) {
+    $DMARCPolicy = Read-DmarcPolicy -Domain $Domain -ErrorAction Stop
+
+    If ([string]::IsNullOrEmpty($DMARCPolicy.Record)) {
         $Result.DMARCPresent = $false
-        $ScoreExplanation.Add("No DMARC Records Found") | Out-Null
+        $ScoreExplanation.Add('No DMARC Records Found') | Out-Null
     }
     else {
         $Result.DMARCPresent = $true
         $ScoreDomain += $Scores.DMARCPresent
 
-        $Result.DMARCFullPolicy = $DMARCResults.data
-        if (($Result.DMARCFullPolicy.replace(' ', '') -like '*;p=reject*')) { 
-            $Result.DMARCActionPolicy = "Reject"
+        $Result.DMARCFullPolicy = $DMARCResults.Record
+        if ($DMARCPolicy.Policy -eq 'reject' -and $DMARCPolicy.SubdomainPolicy -eq 'reject') { 
+            $Result.DMARCActionPolicy = 'Reject'
             $ScoreDomain += $Scores.DMARCSetReject
         }
-        if ($Result.DMARCFullPolicy -like '*p=n*') { 
-            $Result.DMARCActionPolicy = "None"
-            $ScoreExplanation.Add("DMARC is not being enforced") | Out-Null 
+        if ($DMARCPolicy.Policy -eq 'none') { 
+            $Result.DMARCActionPolicy = 'None'
+            $ScoreExplanation.Add('DMARC is not being enforced') | Out-Null 
         }
-        if ($Result.DMARCFullPolicy -like '*p=qua*') {
-            $Result.DMARCActionPolicy = "Quarantine"
+        if ($DMARCPolicy.Policy -eq 'quarantine') {
+            $Result.DMARCActionPolicy = 'Quarantine'
             $ScoreDomain += $Scores.DMARCSetQuarantine
-            $ScoreExplanation.Add("DMARC Partially Enforced with quarantine") | Out-Null
+            $ScoreExplanation.Add('DMARC Partially Enforced with quarantine') | Out-Null
         }
-        if (($Result.DMARCFullPolicy -like '*rua*') -or ($Result.DMARCHFullPolicy -like '*ruf*')) {
+
+        $ReportEmailCount = $DMARCPolicy.ReportingEmails | Measure-Object | Select-Object -ExpandProperty Count
+        if ($ReportEmailCount -gt 0) {
             $Result.DMARCReportingActive = $true
             $ScoreDomain += $Scores.DMARCReportingActive
         }
         else {
             $Result.DMARCReportingActive = $False
-            $ScoreExplanation.Add("DMARC Reporting not Configured") | Out-Null
+            $ScoreExplanation.Add('DMARC Reporting not Configured') | Out-Null
         }
-        if ($Result.DMARCFullPolicy -like '*pct=*') {
-            if ($Result.DMARCFullPolicy -like '*pct=100*') {
-                $Result.DMARCPercentagePass = $true
-                $ScoreDomain += $Scores.DMARCPercentageGood
-            }
-            else {
-                $Result.DMARCPercentagePass = $false
-                $ScoreExplanation.Add("DMARC Not Checking All Messages") | Out-Null                
-            } 
+
+        if ($DMARCPolicy.Percent -eq 100) {
+            $Result.DMARCPercentagePass = $true
+            $ScoreDomain += $Scores.DMARCPercentageGood
         }
         else {
-            $Result.DMARCPercentagePass = $true 
-            $ScoreDomain += $Scores.DMARCPercentageGood
+            $Result.DMARCPercentagePass = $false
+            $ScoreExplanation.Add('DMARC Not Checking All Messages') | Out-Null                
         }
     }
 }
 catch {
-    Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "Exception and Error while getting DMARC Record with $($_.Exception.Message)" -sev Error
+    $Message = 'DMARC Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+    throw $Message
 }
 
 # DNS Sec Check
 try {
-    $DNSSECResult = Get-GoogleDNSQuery -Domain "$($domain)" -RecordType "SOA" -FullResultRecord $true
-    if ($DNSSECResult.AD) {
+    $DNSSECResult = Test-DNSSEC -Domain $Domain -ErrorAction Stop
+    $DNSSECFailCount = $DNSSECResult.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
+    $DNSSECWarnCount = $DNSSECResult.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
+    if (($DNSSECFailCount + $DNSSECWarnCount) -eq 0) {
         $Result.DNSSECPresent = $true
         $ScoreDomain += $Scores.DNSSECPresent
     }
     else {
         $Result.DNSSECPresent = $false
-        $ScoreExplanation.Add("DNSSEC Not Configured or Enabled") | Out-Null 
+        $ScoreExplanation.Add('DNSSEC Not Configured or Enabled') | Out-Null 
     }
 }
 catch {
-    Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "Exception and Error while getting DNSSEC with $($_.Exception.Message)" -sev Error
+    $Message = 'DNSSEC Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+    throw $Message
 }
 
 # DKIM Check
 try {
-    # We can only really do Google and 365 DKIM so lets work out whether we are on Google or 365
-    if ($Result.ActualMXRecord -like '*protection.outlook.com*') {
-        $Result.MailProvider = "Microsoft 365"
-        $DKIMSelector = "selector1._domainkey.$($domain)"
+    $DkimParams = @{
+        Domain = $Domain
     }
-        
-    if ($Result.ActualMXRecord -like '*l.google.com*') {
-        $Result.MailProvider = "Google"
-        $DKIMSelector = "google._domainkey.$($domain)"
+    if (![string]::IsNullOrEmpty($DomainObject.DkimSelectors)) {
+        $DkimParams.Selectors = $DomainObject.DkimSelectors | ConvertFrom-Json
     }
 
-    if ([string]::IsNullOrEmpty($Result.MailProvider)) {
-        $Result.MailProvider = "Unknown"
+    $DkimRecord = Read-DkimRecord @DkimParams -ErrorAction Stop
+    
+    $DkimRecordCount = $DkimRecord.Records | Measure-Object | Select-Object -ExpandProperty Count
+    $DkimFailCount = $DkimRecord.ValidationFails | Measure-Object | Select-Object -ExpandProperty Count
+    #$DkimWarnCount = $DkimRecord.ValidationWarns | Measure-Object | Select-Object -ExpandProperty Count
+    if ($DkimRecordCount -gt 0 -and $DkimFailCount -eq 0) {
+        $Result.DKIMEnabled = $true
+        $ScoreDomain += $Scores.DKIMActiveAndWorking
     }
-
-    if ($Result.MailProvider -ne 'Unknown') {
-        $DKIMResult = Get-GoogleDNSQuery -Domain $DKIMSelector -RecordType "TXT"
-        if ($DKIMResult.Data -like '*v=DKIM1*') {
-            $Result.DKIMEnabled = $true
-            $ScoreDomain += $Scores.DKIMActiveAndWorking
-        }
-        else {
-            $Result.DKIMEnabled = $false
-            $ScoreExplanation.Add("DKIM Not Configured") | Out-Null 
-        }
+    else {
+        $Result.DKIMEnabled = $false
+        $ScoreExplanation.Add('DKIM Not Configured') | Out-Null 
     }
-
 }
 catch {
-    Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "DKIM Lookup Failed with $($_.Exception.Message)" -sev Error
+    $Message = 'DKIM Exception: {0} line {1} - {2}' -f $_.InvocationInfo.ScriptName, $_.InvocationInfo.ScriptLineNumber, $_.Exception.Message
+    Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message $Message -sev Error
+    throw $Message
 }
 # Final Score
 $Result.Score = $ScoreDomain
-$Result.ScorePercentage = [int](($Result.Score / $Result.MaximumScore)*100)
-$Result.ScoreExplanation = ($ScoreExplanation) -join ", "
+$Result.ScorePercentage = [int](($Result.Score / $Result.MaximumScore) * 100)
+$Result.ScoreExplanation = ($ScoreExplanation) -join ', '
+
+
+$DomainObject.DomainAnalyser = ($Result | ConvertTo-Json -Compress).ToString()
 
 # Final Write to Output
-Log-request -API "DomainAnalyser" -tenant $tenant.tenant -message "DNS Analyser Finished For $($Result.Domain)" -sev Info
-Write-Output $Result
+Write-LogMessage -API 'DomainAnalyser' -tenant $tenant.tenant -message "DNS Analyser Finished For $Domain" -sev Info
 
+Write-Output $DomainObject

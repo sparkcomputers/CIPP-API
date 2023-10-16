@@ -4,23 +4,10 @@ using namespace System.Net
 param($Request, $TriggerMetadata)
 
 $APIName = $TriggerMetadata.FunctionName
-Log-Request -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Accessed this API" -Sev "Debug"
-
-
-# Write to the Azure Functions log stream.
-Write-Host "PowerShell HTTP trigger function processed a request."
-Write-Host "$($Request.query.ID)"
-# Interact with query parameters or the body of the request.
-$TenantFilter = $Request.Query.TenantFilter
-$disableUser = '{"accountEnabled":"false"}'
 try {
-      if ($TenantFilter -eq $null -or $TenantFilter -eq "null") {
-            $GraphRequest = New-GraphPostRequest -uri "https://graph.microsoft.com/v1.0/users/$($Request.query.ID)" -type PATCH -body $DisableUser  -verbose
-      }
-      else {
-            $GraphRequest = New-GraphPostRequest -uri "https://graph.microsoft.com/v1.0/users/$($Request.query.ID)" -tenantid $TenantFilter -type PATCH -body $DisableUser  -verbose
-      }
-      $Results = [pscustomobject]@{"Results" = "Successfully completed request." }
+      ([System.Convert]::ToBoolean($Request.Query.Enable))
+      $State = Set-CIPPSignInState -userid $Request.query.ID -TenantFilter $Request.Query.TenantFilter -APIName $APINAME -ExecutingUser $request.headers.'x-ms-client-principal' -AccountEnabled ([System.Convert]::ToBoolean($Request.Query.Enable))
+      $Results = [pscustomobject]@{"Results" = "$State" }
 }
 catch {
       $Results = [pscustomobject]@{"Results" = "Failed. $($_.Exception.Message)" }

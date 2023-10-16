@@ -4,9 +4,9 @@ using namespace System.Net
 param($Request, $TriggerMetadata)
 
 $APIName = $TriggerMetadata.FunctionName
-Log-Request -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Accessed this API" -Sev "Debug"
+Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Accessed this API" -Sev "Debug"
 
-$selectlist = "id", "companyName","displayName","mail","onPremisesSyncEnabled","editURL"
+$selectlist = "id", "companyName", "displayName", "mail", "onPremisesSyncEnabled", "editURL"
 
 # Write to the Azure Functions log stream.
 Write-Host "PowerShell HTTP trigger function processed a request."
@@ -17,15 +17,19 @@ $TenantFilter = $Request.Query.TenantFilter
 $ContactID = $Request.Query.ContactID
 
 Write-Host "Tenant Filter: $TenantFilter"
-
-$GraphRequest = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/contacts/$($ContactID)?`$top=999&`$select=$($selectlist -join ',')" -tenantid $TenantFilter | Select-Object $selectlist | foreach-object {
-    $_.editURL = "https://outlook.office365.com/ecp/@$TenantFilter/UsersGroups/EditContact.aspx?exsvurl=1&realm=$($Env:TenantID)&mkt=en-US&id=$($_.id)"
-    $_
+try {
+    $GraphRequest = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/contacts/$($ContactID)?`$top=999&`$select=$($selectlist -join ',')" -tenantid $TenantFilter | Select-Object $selectlist | ForEach-Object {
+        $_.editURL = "https://outlook.office365.com/ecp/@$TenantFilter/UsersGroups/EditContact.aspx?exsvurl=1&realm=$($env:TenantID)&mkt=en-US&id=$($_.id)"
+        $_
+    }
+    $StatusCode = [HttpStatusCode]::OK
 }
-
-# Associate values to output bindings by calling 'Push-OutputBinding'.
+catch {
+    $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+    $StatusCode = [HttpStatusCode]::Forbidden
+    $GraphRequest = $ErrorMessage
+}
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-        StatusCode = [HttpStatusCode]::OK
-        Body       = @($GraphRequest)
+        StatusCode = $StatusCode
+        Body       = @($GraphRequest | Where-Object -Property id -ne $null)
     })
-

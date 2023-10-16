@@ -1,4 +1,6 @@
 param($name)
 
-$object = (get-childitem ".\ChocoApps.Cache\*").name
+$Table = Get-CippTable -tablename 'apps'
+
+$Object = (Get-AzDataTableEntity @Table).RowKey
 $object

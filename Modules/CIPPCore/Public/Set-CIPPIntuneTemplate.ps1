@@ -8,8 +8,8 @@ function Set-CIPPIntuneTemplate {
         $templateType
     )
 
-    if (!$DisplayName) { throw "You must enter a displayname" }
-    if ($null -eq ($RawJSON | ConvertFrom-Json)) { throw "the JSON is invalid" }
+    if (!$DisplayName) { throw 'You must enter a displayname' }
+    if ($null -eq ($RawJSON | ConvertFrom-Json)) { throw 'the JSON is invalid' }
 
     $object = [PSCustomObject]@{
         Displayname = $DisplayName
@@ -20,13 +20,13 @@ function Set-CIPPIntuneTemplate {
     } | ConvertTo-Json -Depth 10 -Compress
     $Table = Get-CippTable -tablename 'templates'
     $Table.Force = $true
-    Add-AzDataTableEntity @Table -Entity @{
+    Add-CIPPAzDataTableEntity @Table -Entity @{
         JSON         = "$object"
         RowKey       = "$GUID"
         GUID         = "$GUID"
-        PartitionKey = "IntuneTemplate"
+        PartitionKey = 'IntuneTemplate'
     }
-    Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Created intune policy template named $($Request.body.displayname) with GUID $GUID" -Sev "Debug"
+    Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -message "Created intune policy template named $($Request.body.displayname) with GUID $GUID" -Sev 'Debug'
 
-    return "Successfully added template" 
+    return 'Successfully added template'
 }
